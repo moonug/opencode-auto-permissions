@@ -1,5 +1,6 @@
 import { AUTO_PERMISSIONS_MESSAGE_PREFIX, normalizeAskedEvent, normalizeRepliedEvent } from "./context.ts"
 import type { PermissionRequest, RuntimeContext } from "./types.ts"
+import { createStableHistory } from "./stable-history.ts"
 
 type Handler = (event: unknown) => void
 
@@ -11,9 +12,10 @@ export function createStableRuntime(
   const client = compatibleClient(injectedClient)
   const listeners = new Map<string, Set<Handler>>()
   const sessions = new Map<string, { id: string; parentID?: string }>()
-  const messages = new Map<string, unknown[]>()
+  const history = createStableHistory(client, directory)
   const pending = new Map<string, PermissionRequest>()
   const resumeControllers = new Set<AbortController>()
+  let sessionRevision = 0
 
   const on = (type: string, handler: Handler) => {
     const handlers = listeners.get(type) ?? new Set<Handler>()
@@ -24,11 +26,6 @@ export function createStableRuntime(
 
   const dispatch = (type: string, event: unknown) => {
     for (const handler of listeners.get(type) ?? []) handler(event)
-  }
-
-  const syncMessages = async (sessionID: string) => {
-    const result = unwrap(await client.session.messages({ path: { id: sessionID }, query: { directory, limit: 200 } }))
-    messages.set(sessionID, Array.isArray(result) ? result : [])
   }
 
   const syncPermissions = async () => {
@@ -42,6 +39,7 @@ export function createStableRuntime(
   }
 
   const root = async (sessionID: string) => {
+    const observed = sessionRevision
     const seen = new Set<string>()
     let current = sessionID
     while (!seen.has(current)) {
@@ -49,6 +47,7 @@ export function createStableRuntime(
       let session = sessions.get(current)
       if (!session) {
         const result = unwrap(await client.session.get({ path: { id: current }, query: { directory } }))
+        if (sessionRevision !== observed) throw new Error("Stable session changed during lookup")
         if (!isRecord(result) || typeof result.id !== "string") return sessionID
         session = {
           id: result.id,
@@ -71,10 +70,12 @@ export function createStableRuntime(
         root,
         get: (sessionID) => sessions.get(sessionID),
         message: {
-          list: (sessionID) => messages.get(sessionID) ?? [],
+          list: history.list,
           get: (sessionID, messageID) =>
-            (messages.get(sessionID) ?? []).find((message) => messageIDOf(message) === messageID),
-          sync: syncMessages,
+            history.list(sessionID).find((message) => messageIDOf(message) === messageID),
+          sync: history.sync,
+          metadata: history.metadata,
+          source: history.source,
         },
         permission: {
           list: (sessionID) => [...pending.values()].filter((request) => request.sessionID === sessionID),
@@ -95,7 +96,7 @@ export function createStableRuntime(
       void waitForIdle(client, sessionID, directory, controller.signal)
         .then((idle) => {
           if (!idle || controller.signal.aborted) return
-          const routing = latestUserRouting(messages.get(sessionID) ?? [])
+          const routing = latestUserRouting(history.list(sessionID))
           return client.session.promptAsync({
             path: { id: sessionID },
             query: { directory },
@@ -115,12 +116,49 @@ export function createStableRuntime(
 
   return {
     context,
+    observe(event: unknown) {
+      history.observe(event)
+      if (!isRecord(event)) return
+      if (["session.reset", "server.connected", "server.instance.disposed"].includes(event.type)) {
+        sessionRevision++
+        sessions.clear()
+        return
+      }
+      if (!["session.updated", "session.created", "session.deleted"].includes(event.type)) return
+      const data = event.properties ?? event.data
+      const id = data?.info?.id ?? data?.sessionID
+      if (typeof id !== "string") {
+        sessionRevision++
+        history.observe({ type: "session.reset" })
+        sessions.clear()
+        return
+      }
+      const previous = sessions.get(id)
+      if (event.type === "session.updated" && previous && isRecord(data?.info)
+        && previous.parentID === data.info.parentID) return
+      sessionRevision++
+      // Invalidate descendants too: their collected root/delegation chain changed.
+      for (const session of sessions.values()) {
+        const seen = new Set<string>()
+        let current: string | undefined = session.id
+        while (current && !seen.has(current)) {
+          if (current === id) {
+            history.observe({ type: "session.deleted", properties: { sessionID: session.id } })
+            break
+          }
+          seen.add(current)
+          current = sessions.get(current)?.parentID
+        }
+      }
+      sessions.delete(id)
+    },
     async version(): Promise<string | undefined> {
       if (typeof client.global?.health !== "function") return undefined
       const result = unwrap(await client.global.health())
       return isRecord(result) && typeof result.version === "string" ? result.version : undefined
     },
-    emit(event: unknown) {
+    emit(event: unknown, observed = false) {
+      if (!observed) this.observe(event)
       const asked = normalizeAskedEvent(event)
       if (asked?.protocol === "stable") {
         pending.set(asked.id, asked)
@@ -136,7 +174,7 @@ export function createStableRuntime(
     dispose() {
       listeners.clear()
       sessions.clear()
-      messages.clear()
+      history.dispose()
       pending.clear()
       for (const controller of resumeControllers) controller.abort()
       resumeControllers.clear()

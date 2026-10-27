@@ -24,6 +24,25 @@ export type Decision =
   | { kind: "allow_session"; reasonCode: string; reason: string }
   | { kind: "deny"; reasonCode: string; reason: string }
 
+export interface QuestionFraming {
+  question: string
+  header?: string
+  options: { label: string; description?: string }[]
+  multiple?: boolean
+  custom?: boolean
+}
+
+export type HumanInteraction =
+  | { type: "message"; sessionID: string; text: string; createdAt?: number }
+  | {
+      type: "question_answer"
+      sessionID: string
+      callID: string
+      completedAt: number
+      questions: QuestionFraming[]
+      answers: string[][]
+    }
+
 export interface ReviewInput {
   request: {
     action: string
@@ -35,7 +54,11 @@ export interface ReviewInput {
     rootSessionID: string
     directory?: string
     userMessages: string[]
+    humanInteractions: HumanInteraction[]
+    delegationMessages: { sessionID: string; text: string }[]
+    incomplete: boolean
     model?: ReviewModel
+    historyRevisions?: { sessionID: string; revision: number }[]
   }
 }
 
@@ -45,7 +68,9 @@ export interface SessionData {
   message: {
     list(sessionID: string): unknown[]
     get(sessionID: string, messageID: string): unknown
-    sync(sessionID: string): Promise<void>
+    source?(sessionID: string, messageID: string): Promise<unknown>
+    sync(sessionID: string, sourceMessageID?: string): Promise<unknown>
+    metadata?(sessionID: string, includeText?: boolean): { revision: number; incomplete: boolean; ambiguousTimes?: number[]; unknownTime?: boolean; hasQuestion?: boolean }
   }
   permission: {
     list(sessionID: string): PermissionRequest[] | undefined

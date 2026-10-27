@@ -4,10 +4,15 @@ const SHELL_COMPOSITION = /[;&|<>`\n]|\$\(|<\(|>\(/
 
 export function applyDeterministicPolicy(input: ReviewInput): Decision | null {
   const { action, resources } = input.request
+  if (input.context.incomplete) {
+    return deny("incomplete_human_context", "Human context is incomplete or ambiguously ordered; provide complete, bounded instructions before retrying.")
+  }
   if (explicitlyProhibited(input)) {
     return deny("explicit_user_prohibition", "The user explicitly prohibited this action.")
   }
-  if (action === "external_directory" && isOwnDiagnosticsAccess(input)) {
+  const needsContextualReview = input.context.delegationMessages.length > 0
+    || input.context.humanInteractions.some((item) => item.type === "question_answer")
+  if (!needsContextualReview && action === "external_directory" && isOwnDiagnosticsAccess(input)) {
     return {
       kind: "allow",
       reasonCode: "own_diagnostics_access",
@@ -25,7 +30,7 @@ export function applyDeterministicPolicy(input: ReviewInput): Decision | null {
     )
   }
 
-  if (!SHELL_COMPOSITION.test(command) && isRoutineLocalCommand(command)) {
+  if (!needsContextualReview && !SHELL_COMPOSITION.test(command) && isRoutineLocalCommand(command)) {
     return {
       kind: "allow",
       reasonCode: "routine_local_command",
@@ -51,7 +56,9 @@ function isOwnDiagnosticsAccess(input: ReviewInput): boolean {
 }
 
 function explicitlyProhibited(input: ReviewInput): boolean {
-  const message = input.context.userMessages.at(-1)
+  const latest = input.context.humanInteractions.at(-1)
+  if (latest?.type !== "message") return false
+  const message = latest.text
   if (!message || !/\b(?:explicitly prohibit|do not (?:run|execute|use|access)|must not (?:run|execute|use|access))\b/i.test(message)) {
     return false
   }

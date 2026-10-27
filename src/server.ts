@@ -126,9 +126,10 @@ const legacyPlugin: LegacyPlugin = async (input, options = {}) => {
       output.system.splice(0, output.system.length, REVIEWER_SYSTEM_PROMPT)
     },
     async event(input: LegacyEventInput) {
+      stable.observe(input.event)
       detectedProtocol ??= protocolForVersion(eventVersion(input.event))
       if (!(await startStableReviewer())) return
-      stable.emit(input.event)
+      stable.emit(input.event, true)
     },
     async dispose() {
       stopStableReviewer?.()

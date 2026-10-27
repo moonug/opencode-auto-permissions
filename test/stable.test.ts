@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { installReviewer } from "../src/reviewer.ts"
 import { createStableRuntime, protocolForVersion } from "../src/stable.ts"
 
 function client() {
@@ -59,6 +60,61 @@ function client() {
 }
 
 describe("createStableRuntime", () => {
+  test.each([
+    { name: "truncated prohibition", instruction: "Do not execute pnpm test.", count: 200, expectedReply: "reject" },
+    { name: "full page", instruction: "Run the tests.", count: 199, expectedReply: "reject" },
+    { name: "complete bounded page", instruction: "Run the tests.", count: 198, expectedReply: "once" },
+    { name: "invalid page", instruction: "Run the tests.", count: 0, expectedReply: "reject" },
+  ])("checks bounded message-source completeness: $name", async ({ name, instruction, count, expectedReply }) => {
+    const injected = client()
+    const messages = [
+      { info: { id: "msg_human", role: "user" }, parts: [{ type: "text", text: instruction }] },
+      ...Array.from({ length: count }, (_, index) => ({
+        info: { id: `msg_assistant_${index}`, role: "assistant" }, parts: [{ type: "text", text: "Inspecting source." }],
+      })),
+    ]
+    const pending = { id: "per_history", sessionID: "ses_root", permission: "bash", patterns: ["pnpm test"], always: [] }
+    const runtime = createStableRuntime({
+      ...injected,
+      session: {
+        ...injected.session,
+        messages: async ({ query }: { query: { limit: number } }) => ({
+          data: name === "invalid page" ? {} : messages.slice(-query.limit),
+        }),
+      },
+      permission: { list: async () => ({ data: [pending] }) },
+    }, { model: "fixture/reviewer" }, "/repo")
+    const replies: string[] = []
+    const failures: unknown[] = []
+    let calls = 0
+    let complete!: () => void
+    const completed = new Promise<void>((resolve) => { complete = resolve })
+    const dispose = installReviewer(runtime.context, {
+      client: {
+        generate: async () => {
+          calls++
+          return { decision: "allow", reasonCode: "fixture_only", reason: "Offline fixture approval." }
+        },
+        reply: async ({ reply }) => {
+          replies.push(reply)
+          complete()
+          return "replied"
+        },
+      },
+      onFailure: (_request, error) => { failures.push(error) },
+    })
+    try {
+      runtime.emit({ type: "permission.asked", properties: pending })
+      await completed
+      expect(replies).toEqual([expectedReply])
+      expect(calls).toBe(0)
+      expect(failures).toHaveLength(expectedReply === "once" ? 0 : 1)
+    } finally {
+      dispose()
+      runtime.dispose()
+    }
+  })
+
   test("detects stable and V2 runtime versions", () => {
     expect(protocolForVersion("1.18.12")).toBe("stable")
     expect(protocolForVersion("0.0.0-beta-202608040144")).toBe("v2")
