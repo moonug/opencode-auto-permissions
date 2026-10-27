@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { OpenCodeClientAdapter } from "./opencode-client.ts"
 import { parseConfig, type Config } from "./config.ts"
 import {
@@ -18,6 +19,8 @@ import type {
 } from "./types.ts"
 import { parseDecision } from "./verdict.ts"
 import { describeError, failureCategory, writeDiagnostic } from "./diagnostics.ts"
+
+const MAX_SESSION_APPROVALS = 128
 
 export interface ReviewerOverrides {
   client?: ReviewerClient
@@ -123,7 +126,7 @@ async function reviewAndReply(
     ? {
         kind: "allow" as const,
         reasonCode: "session_approval_reused",
-        reason: "Reuses an approved narrow pattern from this session.",
+        reason: "Reuses an explicitly approved operation with unchanged input and context.",
       }
     : undefined
   const reviewKey = concurrentReviewKey(request, input)
@@ -135,40 +138,49 @@ async function reviewAndReply(
       if (sharedReviews.get(reviewKey) === shared) sharedReviews.delete(reviewKey)
     }).catch(() => undefined)
   }
-  const decision = policyDecision ?? cachedDecision ?? (await shared!)
+  const reviewedDecision = policyDecision ?? cachedDecision ?? (await shared!)
   if (parentSignal.aborted) return
-
-  if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey)
+  if (!config.shadow && !await isRequestPending(context, request)) return
+  const current = await collectReviewInput(context, request, config.userMessageCount)
+  if (parentSignal.aborted) return
+  const changed = concurrentReviewKey(request, current) !== reviewKey
+  let decision = reviewedDecision
+  if (changed) {
+    const currentPolicy = applyDeterministicPolicy(current)
+    decision = currentPolicy?.kind === "deny" ? currentPolicy : {
+      kind: "deny", reasonCode: "changed_human_context",
+      reason: "Human context changed during review; the previous decision cannot authorize this action.",
+    }
   }
+  const source = changed ? "policy" : decisionSource(policyDecision, cachedDecision)
 
   overrides.onDecision?.(request, decision, config.shadow)
   if (config.shadow) {
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision))
+    writeDecision(config, request, startedAt, decision, source)
     return
   }
 
-  const pending = await isRequestPending(context, request)
-  if (!pending || parentSignal.aborted) return
-
   if (decision.kind === "allow" || decision.kind === "allow_session") {
-    const reply = decision.kind === "allow_session" && eligibleForSessionApproval(config, request, input)
-      ? "always"
-      : "once"
     const result = await client.reply({
       sessionID: request.sessionID,
       requestID: request.id,
-      reply,
+      reply: "once",
       protocol: request.protocol,
     })
+    if (result === "replied" && approvalKey && decision.kind === "allow_session") {
+      if (!sessionApprovals.has(approvalKey) && sessionApprovals.size >= MAX_SESSION_APPROVALS) {
+        sessionApprovals.delete(sessionApprovals.values().next().value!)
+      }
+      sessionApprovals.add(approvalKey)
+    }
     writeDecision(
       config,
       request,
       startedAt,
       decision,
-      decisionSource(policyDecision, cachedDecision),
+      source,
       result,
-      reply === "always" ? "session" : "once",
+      "once",
     )
     return
   }
@@ -181,7 +193,7 @@ async function reviewAndReply(
     protocol: request.protocol,
   })
   context.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4_000 })
-  writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result)
+  writeDecision(config, request, startedAt, decision, source, result)
   if (result === "replied") context.resumeAfterDenial?.(request.sessionID, decision.reason)
 }
 
@@ -218,6 +230,7 @@ function eligibleForSessionApproval(
   request: PermissionRequest,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): boolean {
+  if (input.context.incomplete || input.context.humanInteractions.some((item) => item.type === "question_answer")) return false
   if (!config.sessionApprovals || request.always.length === 0) return false
   if (request.always.some((pattern) => isBroadPattern(pattern))) return false
   if ([...request.resources, ...request.always].some((value) => isSensitiveTarget(value))) return false
@@ -227,6 +240,8 @@ function eligibleForSessionApproval(
     ? Reflect.get(input.request.toolInput, "command")
     : input.request.resources.join(" && ")
   if (typeof command !== "string") return false
+  if (/[;&|<>`\n]|\$\(|<\(|>\(/.test(command)) return false
+  if (applyDeterministicPolicy(input)?.reasonCode !== "routine_local_command" && !/^git\s+fetch(?:\s|$)/.test(command)) return false
   return !isSensitiveTarget(command)
     && !/\b(?:sudo|rm|rmdir|shred|git\s+(?:push|reset|clean|rebase)|npm\s+publish|pnpm\s+publish|yarn\s+npm\s+publish|deploy|terraform\s+apply|kubectl\s+(?:apply|delete)|curl\b[^\n|]*\|\s*(?:ba|z|k)?sh)\b/i.test(command)
 }
@@ -237,14 +252,20 @@ function reusableApprovalKey(
   input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): string | undefined {
   if (!eligibleForSessionApproval(config, request, input)) return undefined
-  return JSON.stringify([input.context.rootSessionID, request.action, request.always])
+  const { historyRevisions: _historyRevisions, ...semanticContext } = input.context
+  return fingerprint([request.sessionID, input.request, semanticContext])
 }
 
 function concurrentReviewKey(
   request: PermissionRequest,
   input: Awaited<ReturnType<typeof collectReviewInput>>,
 ): string {
-  return JSON.stringify([input.context.rootSessionID, request.action, request.resources, input.request.toolInput])
+  const { historyRevisions: _historyRevisions, ...semanticContext } = input.context
+  return fingerprint([request.protocol, request.sessionID, { ...input, context: semanticContext }])
+}
+
+function fingerprint(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex")
 }
 
 function decisionSource(

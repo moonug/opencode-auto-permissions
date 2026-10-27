@@ -21,7 +21,7 @@ function harness(options: Record<string, unknown> = { model: "cloudflare-workers
       },
       session: {
         root: () => "ses_root",
-        get: (id) => ({ id }),
+        get: (id) => ({ id, ...(id === "ses_root" ? {} : { parentID: "ses_root" }) }),
         message: {
           list: () => {
             const command = requests[0]?.resources[0] ?? "pnpm test"
@@ -135,7 +135,545 @@ async function settle() {
   await new Promise((resolve) => setTimeout(resolve, 10))
 }
 
+function fixtureRuntime(protocol: PermissionRequest["protocol"]) {
+  const app = harness()
+  const nativeGrants = new Set<string>()
+  const events = { asked: 0, skipped: 0 }
+  const key = (pending: PermissionRequest) => JSON.stringify([pending.sessionID, pending.action, pending.resources])
+  const reply = app.client.reply
+  app.client.reply = async (input) => {
+    const pending = app.requests.find((item) => item.id === input.requestID)
+    if (input.reply === "always" && pending) nativeGrants.add(key(pending))
+    return reply(input)
+  }
+  return {
+    ...app,
+    events,
+    async ask(pending: PermissionRequest) {
+      if (nativeGrants.has(key(pending))) {
+        events.skipped++
+        return "always"
+      }
+      events.asked++
+      app.requests.push(pending)
+      if (protocol === "stable") {
+        app.emit("permission.asked", {
+          id: pending.id, sessionID: pending.sessionID, permission: pending.action,
+          patterns: pending.resources, always: pending.always, tool: pending.source,
+        })
+      } else {
+        app.emit("permission.v2.asked", pending)
+      }
+      await settle()
+      return app.replies.find((item) => item.requestID === pending.id)?.reply
+    },
+  }
+}
+
+function questionMessage(protocol: "stable" | "v2", answer = "Skip tests", completed = 3, framing = "Should I skip tests?") {
+  const state = {
+    status: "completed",
+    input: { questions: [{ question: framing, options: [{ label: answer }] }] },
+    ...(protocol === "stable"
+      ? { metadata: { answers: [[answer]] }, time: { start: 2, end: completed } }
+      : { structured: { answers: [[answer]] } }),
+  }
+  return protocol === "stable"
+    ? { info: { role: "assistant" }, parts: [{ type: "tool", tool: "question", callID: "question_1", state }] }
+    : { type: "assistant", content: [{ type: "tool", name: "question", id: "question_1", state, time: { completed } }] }
+}
+
 describe("installReviewer", () => {
+  describe.each(["stable", "v2"] as const)("%s native permission runtime", (protocol) => {
+    test("fixture skips asked events after a native always grant", async () => {
+      const app = fixtureRuntime(protocol)
+      const first = request("git fetch origin", protocol, "per_first")
+      app.requests.push(first)
+      await app.client.reply({ sessionID: first.sessionID, requestID: first.id, reply: "always", protocol })
+
+      expect(await app.ask(request("git fetch origin", protocol, "per_second"))).toBe("always")
+      expect(app.events).toEqual({ asked: 0, skipped: 1 })
+      expect(app.replies).toHaveLength(1)
+    })
+
+    test.each(["replied", "not_found"] as const)("checks a first native result of %s before reusing an approval", async (firstResult) => {
+      const app = fixtureRuntime(protocol)
+      const reply = app.client.reply
+      const outcomes: string[] = []
+      app.client.reply = async (input) => {
+        const result = await reply(input)
+        const outcome = input.requestID === "per_first" ? firstResult : result
+        outcomes.push(outcome)
+        return outcome
+      }
+      let calls = 0
+      app.client.generate = async () => ++calls === 1
+        ? { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline repeatable approval." }
+        : { decision: "deny", reasonCode: "fixture_deny", reason: "Offline next-request denial." }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        await app.ask(request("git fetch origin", protocol, "per_first"))
+        await app.ask(request("git fetch origin", protocol, "per_second"))
+        expect(outcomes).toEqual([firstResult, "replied"])
+        expect(calls).toBe(firstResult === "replied" ? 1 : 2)
+        expect(app.replies.map((input) => input.reply)).toEqual(["once", firstResult === "replied" ? "once" : "reject"])
+        expect(app.events).toEqual({ asked: 2, skipped: 0 })
+        expect(app.replies.every((input) => input.protocol === protocol)).toBe(true)
+        expect(app.requests).toEqual([])
+      } finally { dispose() }
+    })
+
+    test.each([false, true])("scopes reusable approvals to the requesting session, same requester: %s", async (same) => {
+      const app = fixtureRuntime(protocol)
+      const list = app.context.data.session.message.list
+      app.context.data.session.message.list = (id) => id === "ses_root" ? list(id) : list(id).slice(1)
+      const inputs: unknown[] = []
+      app.client.generate = async ({ prompt }) => {
+        inputs.push(JSON.parse(prompt.slice(prompt.indexOf("\n") + 1)))
+        return inputs.length === 1
+          ? { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline approval for the requesting session." }
+          : { decision: "deny", reasonCode: "fixture_deny", reason: "Offline denial in the other requesting session." }
+      }
+      const first = { ...request("git fetch origin", protocol, "per_first"), sessionID: "ses_a" }
+      const second = { ...first, id: "per_second", sessionID: same ? "ses_a" : "ses_b" }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        await app.ask(first)
+        await app.ask(second)
+        expect(inputs).toHaveLength(same ? 1 : 2)
+        expect(inputs.at(-1)).toEqual(inputs[0])
+        expect(inputs[0]).toMatchObject({ request: { toolInput: { command: "git fetch origin" } },
+          context: { rootSessionID: "ses_root", delegationMessages: [], incomplete: false } })
+        expect(app.replies.map(({ sessionID, requestID, reply }) => [sessionID, requestID, reply])).toEqual([
+          ["ses_a", "per_first", "once"], [second.sessionID, "per_second", same ? "once" : "reject"],
+        ])
+        expect(app.replies.every((reply) => reply.protocol === protocol)).toBe(true)
+        expect(app.events).toEqual({ asked: 2, skipped: 0 })
+        expect(app.requests).toEqual([])
+      } finally { dispose() }
+    })
+
+    test.each(["unchanged", "changed scope", "prohibition", "incomplete", "question answer"])(
+      "plugin-local reuse preserves asked events with %s context",
+      async (scenario) => {
+        const app = fixtureRuntime(protocol)
+        const list = app.context.data.session.message.list
+        let changed = false
+        let text = "Fetch only a different remote."
+        if (scenario === "prohibition") text = "Do not execute git fetch origin."
+        if (scenario === "incomplete") text = "x".repeat(16_001)
+        app.context.data.session.message.list = () => [
+          ...list("ses_root"),
+          ...(changed && scenario === "question answer" ? [questionMessage(protocol)] : []),
+          ...(changed && ["changed scope", "prohibition", "incomplete"].includes(scenario) ? [{
+            type: "user", time: { created: 4 }, text,
+          }] : []),
+        ]
+        let calls = 0
+        app.client.generate = async () => ++calls === 1
+          ? { decision: "allow_session", reasonCode: "repeatable_fetch", reason: "Offline fixture approval." }
+          : { decision: "deny", reasonCode: "changed_scope", reason: "The updated scope does not permit this fetch." }
+        const dispose = installReviewer(app.context, { client: app.client })
+        try {
+          const first = await app.ask(request("git fetch origin", protocol, "per_first"))
+          changed = true
+          const second = await app.ask(request("git fetch origin", protocol, "per_second"))
+
+          expect(app.events).toEqual({ asked: 2, skipped: 0 })
+          expect([first, second]).toEqual(["once", scenario === "unchanged" ? "once" : "reject"])
+          expect(calls).toBe(["changed scope", "question answer"].includes(scenario) ? 2 : 1)
+          expect(app.replies.every((item) => item.reply !== "always")).toBe(true)
+          expect(app.replies.every((item) => item.protocol === protocol)).toBe(true)
+        } finally {
+          dispose()
+        }
+      },
+    )
+
+    test.each([
+      { framing: "Which previous restriction should I keep?", decision: "deny", reply: "reject" },
+      { framing: "Which previous restriction should I remove?", decision: "allow", reply: "once" },
+    ])("reviews a selected prohibition label with its framing: $framing", async ({ framing, decision, reply }) => {
+      const app = fixtureRuntime(protocol)
+      const list = app.context.data.session.message.list
+      const answer = "Do not execute pnpm test."
+      app.context.data.session.message.list = () => [...list("ses_root"), questionMessage(protocol, answer, 3, framing)]
+      const prompts: string[] = []
+      app.client.generate = async ({ prompt }) => {
+        prompts.push(prompt)
+        return { decision, reasonCode: "framed_selection", reason: "Offline fixture interprets the selected restriction in context." }
+      }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        const result = await app.ask(request("pnpm test", protocol))
+        expect(prompts).toHaveLength(1)
+        const input = JSON.parse(prompts[0]!.slice(prompts[0]!.indexOf("\n") + 1))
+        expect(input.context.humanInteractions.at(-1)).toMatchObject({
+          type: "question_answer", questions: [{ question: framing, options: [{ label: answer }] }], answers: [[answer]],
+        })
+        expect(result).toBe(reply)
+        expect(app.events).toEqual({ asked: 1, skipped: 0 })
+      } finally {
+        dispose()
+      }
+    })
+
+    test.each([
+      "ordinary allow", "disabled reuse", "broad pattern", "push", "credential read", "credential shell",
+      "mutating command", "redirection", "composition", "different input",
+    ])("requires another model decision for %s", async (scenario) => {
+      const app = fixtureRuntime(protocol)
+      if (scenario === "disabled reuse") app.context.options = { ...app.context.options, sessionApprovals: false }
+      const command = scenario === "push" ? "git push origin feature"
+        : scenario === "credential shell" ? "cat /repo/.env"
+        : scenario === "mutating command" ? "touch output"
+        : scenario === "redirection" ? "echo hello > output"
+        : scenario === "composition" ? "git fetch origin && touch output" : "git fetch origin"
+      let calls = 0
+      app.client.generate = async () => ++calls === 1
+        ? { decision: scenario === "ordinary allow" ? "allow" : "allow_session", reasonCode: "fixture_allow", reason: "Offline first approval." }
+        : { decision: "deny", reasonCode: "fixture_deny", reason: "Offline second denial." }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        for (let index = 0; index < 2; index++) {
+          const pending = scenario === "credential read" ? toolRequest("read", "/home/user/.ssh/id_ed25519")
+            : request(index && scenario === "different input" ? "git fetch origin main" : command, protocol)
+          pending.id = `per_${index}`
+          pending.protocol = protocol
+          pending.always = scenario === "broad pattern" ? ["*"] : scenario === "different input" ? ["git fetch origin*"] : [...pending.resources]
+          await app.ask(pending)
+        }
+        expect(calls).toBe(2)
+        expect(app.replies.map((reply) => reply.reply)).toEqual(["once", "reject"])
+        expect(app.events).toEqual({ asked: 2, skipped: 0 })
+      } finally {
+        dispose()
+      }
+    })
+
+    test("honors contextual denial for own diagnostics with complete question answers", async () => {
+      const app = fixtureRuntime(protocol)
+      const list = app.context.data.session.message.list
+      app.context.data.session.message.list = () => [
+        ...list("ses_root"), questionMessage(protocol, "Keep diagnostics private", 3, "May I read diagnostics?"),
+      ]
+      const prompts: string[] = []
+      app.client.generate = async ({ prompt }) => {
+        prompts.push(prompt)
+        return { decision: "deny", reasonCode: "private_diagnostics", reason: "Offline question-context denial." }
+      }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        const pending = toolRequest("external_directory", "/home/user/.local/state/opencode/auto-permissions/*")
+        pending.protocol = protocol
+        expect(await app.ask(pending)).toBe("reject")
+        expect(prompts).toHaveLength(1)
+        expect(JSON.parse(prompts[0]!.slice(prompts[0]!.indexOf("\n") + 1)).context).toMatchObject({
+          incomplete: false,
+          humanInteractions: expect.arrayContaining([{
+            type: "question_answer", sessionID: "ses_root", callID: "question_1", completedAt: 3,
+            questions: [{ question: "May I read diagnostics?", options: [{ label: "Keep diagnostics private" }] }],
+            answers: [["Keep diagnostics private"]],
+          }]),
+        })
+      } finally {
+        dispose()
+      }
+    })
+
+    test.each([
+      { action: "shell", resource: "pnpm test", decision: "allow" },
+      { action: "shell", resource: "pnpm test", decision: "deny" },
+      { action: "external_directory", resource: "/home/user/.local/state/opencode/auto-permissions/*", decision: "allow" },
+      { action: "external_directory", resource: "/home/user/.local/state/opencode/auto-permissions/*", decision: "deny" },
+    ])("delegated $action honors contextual $decision", async ({ action, resource, decision }) => {
+      const app = fixtureRuntime(protocol)
+      const root = "Implement the change and finish the task."
+      const scope = action === "shell" ? "Inspect only. Do not execute pnpm test."
+        : "Inspect source only. Do not access /home/user/.local/state/opencode/auto-permissions/."
+      app.context.data.session.message.list = (id) => [{
+        type: "user", text: id === "ses_root" ? root : scope, time: { created: id === "ses_root" ? 1 : 2 },
+      }]
+      const contexts: unknown[] = []
+      app.client.generate = async ({ prompt }) => {
+        contexts.push(JSON.parse(prompt.slice(prompt.indexOf("\n") + 1)).context)
+        return { decision, reasonCode: "delegated_scope", reason: "Offline scoped review." }
+      }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        const pending = toolRequest(action, resource)
+        pending.sessionID = "ses_child"
+        pending.protocol = protocol
+        if (action === "shell" && protocol === "stable") pending.action = "bash"
+        const reply = await app.ask(pending)
+        expect(contexts).toHaveLength(1)
+        expect(contexts[0]).toMatchObject({
+          userMessages: [root],
+          humanInteractions: [{ type: "message", sessionID: "ses_root", text: root }],
+          delegationMessages: [{ sessionID: "ses_child", text: scope }],
+        })
+        expect(reply).toBe(decision === "allow" ? "once" : "reject")
+      } finally {
+        dispose()
+      }
+    })
+
+    test.each([false, true])("binds reuse to independent tool input, changed: %s", async (changed) => {
+      const app = fixtureRuntime(protocol)
+      const input = { command: "git fetch origin" }
+      const tool = { type: "tool", callID: "call_1", id: "call_1", state: { input } }
+      app.context.data.session.message.get = () => protocol === "stable"
+        ? { info: { role: "assistant" }, parts: [tool] }
+        : { type: "assistant", content: [tool] }
+      const commands: string[] = []
+      app.client.generate = async ({ prompt }) => {
+        commands.push(JSON.parse(prompt.slice(prompt.indexOf("\n") + 1)).request.toolInput.command)
+        return commands.length === 1
+          ? { decision: "allow_session", reasonCode: "first_input", reason: "Offline approval of the original operation." }
+          : { decision: "deny", reasonCode: "changed_input", reason: "Offline denial of the changed operation." }
+      }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        await app.ask(request("git fetch origin", protocol, "per_first"))
+        if (changed) input.command = "git fetch origin main"
+        await app.ask(request("git fetch origin", protocol, "per_second"))
+        expect(commands).toEqual(changed ? ["git fetch origin", "git fetch origin main"] : ["git fetch origin"])
+        expect(app.replies.map((reply) => reply.reply)).toEqual(["once", changed ? "reject" : "once"])
+        expect(app.events).toEqual({ asked: 2, skipped: 0 })
+      } finally {
+        dispose()
+      }
+    })
+
+    test("rejects an in-place tool-input change during deferred review", async () => {
+      const app = fixtureRuntime(protocol)
+      const input = { command: "git fetch origin" }
+      const tool = { type: "tool", callID: "call_1", id: "call_1", state: { input } }
+      app.context.data.session.message.get = () => protocol === "stable"
+        ? { info: { role: "assistant" }, parts: [tool] }
+        : { type: "assistant", content: [tool] }
+      let release!: () => void
+      let prompt = ""
+      const reasonCodes: string[] = []
+      app.client.generate = async (request) => {
+        prompt = request.prompt
+        await new Promise<void>((resolve) => { release = resolve })
+        return { decision: "allow_session", reasonCode: "old_operation", reason: "Offline approval of the old input." }
+      }
+      const dispose = installReviewer(app.context, {
+        client: app.client, onDecision: (_request, decision) => { reasonCodes.push(decision.reasonCode) },
+      })
+      try {
+        const running = app.ask(request("git fetch origin", protocol))
+        await settle()
+        expect(typeof release).toBe("function")
+        expect(JSON.parse(prompt.slice(prompt.indexOf("\n") + 1)).request.toolInput).toEqual({ command: "git fetch origin" })
+        input.command = "git fetch origin main"
+        release()
+        await running
+        await settle()
+        expect(app.replies.map((reply) => reply.reply)).toEqual(["reject"])
+        expect(reasonCodes).toEqual(["changed_human_context"])
+      } finally {
+        dispose()
+      }
+    })
+
+    test.each(["root prohibition", "question answer", "delegation"])("rejects an in-flight approval after changed %s", async (scenario) => {
+      const app = fixtureRuntime(protocol)
+      const list = app.context.data.session.message.list
+      let changed = false
+      app.context.data.session.message.list = (id) => {
+        if (scenario === "delegation" && id === "ses_child") return [{ type: "user", text: changed ? "New scope" : "Old scope" }]
+        return [...list("ses_root"), ...(changed && scenario === "root prohibition" ? [{
+          type: "user", text: "Do not execute git fetch origin.", time: { created: 4 },
+        }] : []), ...(changed && scenario === "question answer" ? [questionMessage(protocol)] : [])]
+      }
+      let release!: () => void
+      app.client.generate = async () => {
+        await new Promise<void>((resolve) => { release = resolve })
+        return { decision: "allow_session", reasonCode: "old_approval", reason: "Offline approval of the old snapshot." }
+      }
+      const dispose = installReviewer(app.context, { client: app.client })
+      try {
+        const pending = request("git fetch origin", protocol)
+        if (scenario === "delegation") pending.sessionID = "ses_child"
+        const running = app.ask(pending)
+        await settle()
+        expect(typeof release).toBe("function")
+        changed = true
+        release()
+        await running
+        await settle()
+        expect(app.replies.map((reply) => reply.reply)).toEqual(["reject"])
+      } finally {
+        dispose()
+      }
+    })
+  })
+
+  test.each(["stable", "v2"] as const)("%s question answers require model review even for routine commands", async (protocol) => {
+    const app = harness()
+    const list = app.context.data.session.message.list
+    app.context.data.session.message.list = () => [...list("ses_root"), questionMessage(protocol)]
+    const prompts: string[] = []
+    app.client.generate = async ({ prompt }) => {
+      prompts.push(prompt)
+      return { decision: "deny", reasonCode: "skip_tests", reason: "The user selected skipping tests." }
+    }
+    const pending = request("pnpm test", protocol)
+    app.requests.push(pending)
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", pending)
+      await settle()
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain('"answers":[["Skip tests"]]')
+      expect(app.replies[0]?.reply).toBe("reject")
+    } finally {
+      dispose()
+    }
+  })
+
+  test.each(["stable", "v2"] as const)("%s question context cannot use or create session approvals", async (protocol) => {
+    const app = harness()
+    const list = app.context.data.session.message.list
+    let answered = false
+    app.context.data.session.message.list = () => [...list("ses_root"), ...(answered ? [questionMessage(protocol)] : [])]
+    let calls = 0
+    app.client.generate = async () => {
+      calls++
+      return { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline fixture approval." }
+    }
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      for (let index = 0; index < 3; index++) {
+        answered = index > 0
+        const pending = request("git fetch origin", protocol, `per_${index}`)
+        app.requests.push(pending)
+        app.emit("permission.v2.asked", pending)
+        await settle()
+      }
+      expect(calls).toBe(3)
+      expect(app.replies.map((reply) => reply.reply)).toEqual(["once", "once", "once"])
+    } finally {
+      dispose()
+    }
+  })
+
+  test.each(["prohibition", "oversized", "ambiguous chronology"])("cached approval cannot override %s", async (scenario) => {
+    const app = harness()
+    const list = app.context.data.session.message.list
+    let changed = false
+    app.context.data.session.message.list = () => {
+      const messages = list("ses_root")
+      if (!changed) return messages
+      if (scenario === "ambiguous chronology") return [
+        { type: "user", text: "Run the tests." }, questionMessage("v2"),
+      ]
+      return [
+        ...messages,
+        { type: "user", text: scenario === "prohibition" ? "Do not execute git fetch origin." : "x".repeat(16_001), time: { created: 4 } },
+      ]
+    }
+    let calls = 0
+    app.client.generate = async () => {
+      calls++
+      return { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline fixture approval." }
+    }
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      for (let index = 0; index < 2; index++) {
+        changed = index > 0
+        const pending = request("git fetch origin", "v2", `per_${index}`)
+        app.requests.push(pending)
+        app.emit("permission.v2.asked", pending)
+        await settle()
+      }
+      expect(calls).toBe(1)
+      expect(app.replies.map((reply) => reply.reply)).toEqual(["once", "reject"])
+    } finally {
+      dispose()
+    }
+  })
+
+  test("changed human scope invalidates a narrow cached approval", async () => {
+    const app = harness()
+    let text = "Fetch origin."
+    app.context.data.session.message.list = () => [{ type: "user", text, time: { created: 1 } }]
+    let calls = 0
+    app.client.generate = async () => {
+      calls++
+      return { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline fixture approval." }
+    }
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      for (let index = 0; index < 2; index++) {
+        if (index) text = "Fetch a different target only."
+        const pending = request("git fetch origin", "v2", `per_${index}`)
+        app.requests.push(pending)
+        app.emit("permission.v2.asked", pending)
+        await settle()
+      }
+      expect(calls).toBe(2)
+    } finally {
+      dispose()
+    }
+  })
+
+  test.each(["root message", "question answer", "delegation"])("does not coalesce reviews with different %s context", async (scenario) => {
+    const app = harness()
+    let version = 0
+    app.context.data.session.message.list = (sessionID) => {
+      if (scenario === "delegation" && sessionID === "ses_child") return [{ type: "user", text: `Scope ${version}` }]
+      if (sessionID === "ses_child") return []
+      return [
+        { type: "user", text: scenario === "root message" ? `Request ${version}` : "Prepare configuration.", time: { created: 1 } },
+        ...(scenario === "question answer" ? [questionMessage("v2", `Choice ${version}`)] : []),
+      ]
+    }
+    const releases: Array<() => void> = []
+    app.client.generate = async () => {
+      await new Promise<void>((resolve) => releases.push(resolve))
+      return { decision: "allow", reasonCode: "fixture_allow", reason: "Offline fixture approval." }
+    }
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      for (let index = 0; index < 2; index++) {
+        version = index
+        const pending = request("git push origin feature", "v2", `per_${index}`)
+        if (scenario === "delegation") pending.sessionID = "ses_child"
+        app.requests.push(pending)
+        app.emit("permission.v2.asked", pending)
+        await settle()
+      }
+      expect(releases).toHaveLength(2)
+      for (const release of releases) release()
+      await settle()
+      expect(app.replies).toHaveLength(2)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("a prohibition beyond 4000 characters still rejects a routine command", async () => {
+    const app = harness()
+    app.context.data.session.message.list = () => [{ type: "user", text: `${"Context. ".repeat(600)}Do not execute pnpm test.` }]
+    let calls = 0
+    app.client.generate = async () => { calls++; return { decision: "allow", reasonCode: "fixture_allow", reason: "Offline fixture approval." } }
+    const pending = request("pnpm test")
+    app.requests.push(pending)
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      app.emit("permission.v2.asked", pending)
+      await settle()
+      expect(calls).toBe(0)
+      expect(app.replies[0]?.reply).toBe("reject")
+    } finally {
+      dispose()
+    }
+  })
+
   test("uses the requesting session model when no reviewer model is configured", async () => {
     const app = harness({})
     let model: Parameters<ReviewerClient["generate"]>[0]["model"] | undefined
@@ -288,7 +826,7 @@ describe("installReviewer", () => {
     dispose()
   })
 
-  test("allows a narrow repeatable action for the remainder of the session", async () => {
+  test("keeps a narrow repeatable approval plugin-local with a native once reply", async () => {
     const app = harness()
     app.client.generate = async () => ({
       decision: "allow_session",
@@ -304,17 +842,17 @@ describe("installReviewer", () => {
     await settle()
 
     expect(app.replies).toEqual([
-      { sessionID: "ses_root", requestID: "per_1", reply: "always", protocol: "v2" },
+      { sessionID: "ses_root", requestID: "per_1", reply: "once", protocol: "v2" },
     ])
     dispose()
   })
 
-  test("reuses an approved narrow pattern without another model call", async () => {
+  test("reuses an explicitly approved unchanged operation without another model call", async () => {
     const app = harness()
     let reviews = 0
     app.client.generate = async () => {
       reviews++
-      return { decision: "allow", reasonCode: "approved_fetch", reason: "The fetch is approved." }
+      return { decision: "allow_session", reasonCode: "approved_fetch", reason: "The fetch is approved." }
     }
     const first = request("git fetch origin", "v2", "per_1")
     first.always = ["git fetch origin*"]
@@ -323,7 +861,7 @@ describe("installReviewer", () => {
 
     app.emit("permission.v2.asked", first)
     await settle()
-    const second = request("git fetch origin main", "v2", "per_2")
+    const second = request("git fetch origin", "v2", "per_2")
     second.always = ["git fetch origin*"]
     app.requests.push(second)
     app.emit("permission.v2.asked", second)
@@ -332,6 +870,26 @@ describe("installReviewer", () => {
     expect(reviews).toBe(1)
     expect(app.replies.map((reply) => reply.requestID)).toEqual(["per_1", "per_2"])
     dispose()
+  })
+
+  test("bounds reusable approval storage by evicting old operations", async () => {
+    const app = fixtureRuntime("v2")
+    let calls = 0
+    app.client.generate = async () => {
+      calls++
+      return { decision: "allow_session", reasonCode: "fixture_allow", reason: "Offline repeatable fetch." }
+    }
+    const dispose = installReviewer(app.context, { client: app.client })
+    try {
+      for (let index = 0; index < 129; index++) {
+        await app.ask(request(`git fetch origin branch${index}`, "v2", `per_${index}`))
+      }
+      await app.ask(request("git fetch origin branch0", "v2", "per_again"))
+      expect(calls).toBe(130)
+      expect(app.events).toEqual({ asked: 130, skipped: 0 })
+    } finally {
+      dispose()
+    }
   })
 
   test("coalesces concurrent identical requests into one model review", async () => {
